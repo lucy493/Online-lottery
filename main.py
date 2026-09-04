@@ -1,4 +1,4 @@
-import os
+ import os
 import asyncio
 import random
 import logging
@@ -15,49 +15,51 @@ logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s
 logger = logging.getLogger(__name__)
 
 # Environment Variables
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
-# የቻናል ID ወይም Username (ጽሁፍ ሆኖ እንዲያዝ str)
-CHANNEL_ID = str(os.environ.get("CHANNEL_USERNAME", ""))
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
+ADMIN_ID_RAW = os.environ.get("ADMIN_ID", "0").strip()
+ADMIN_ID = int(ADMIN_ID_RAW) if ADMIN_ID_RAW.isdigit() else 0
+CHANNEL_ID = os.environ.get("CHANNEL_USERNAME", "").strip()
 
 # Data Stores
 user_tickets = {} # user_id: count
-registered_users = set() # የቦቱ ተጠቃሚዎች ID መያዣ
+registered_users = set() # የቦቱ ተጠቃሚዎች ID
 
 # የማስታወቂያ ምስል እና ጽሁፍ
-channel_post_image = "https://picsum.photos/800/400"  # አስተማማኝ የምስል ሊንክ
+channel_post_image = "https://picsum.photos/800/400"
 channel_post_text = "🎰 **የዕድል ማውጫ ጨዋታ!**\n\nበየቀኑና በየሰዓቱ ብዙ ሽልማቶችን ያሸንፉ! አሁኑኑ ታች ያለውን አዝራር ተጭነው ይጫወቱ!"
 wheel_animation_url = "https://media.giphy.com/media/l3V0C199aA4z1Ufmg/giphy.gif"
 
-# Rewards & Probabilities (ፍትሃዊ እና አትራፊ የማሸነፍ እድል)
+# Rewards & Probabilities (80% ባዶ / 0.1% 500 ብር)
 PRIZES = [0, 10, 20, 50, 100, 500]
-WEIGHTS = [80, 10, 5, 4, 0.9, 0.1] # 80% ባዶ፣ 0.1% ብቻ 500 ብር
+WEIGHTS = [80, 10, 5, 4, 0.9, 0.1]
 
 def spin_wheel():
     return random.choices(PRIZES, weights=WEIGHTS, k=1)[0]
 
-# --- COMMAND HANDLERS ---
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    registered_users.add(user_id) # ተጠቃሚውን መመዝገብ
-    
-    if user_id not in user_tickets:
-        user_tickets[user_id] = 3 # ለአዲሶች 3 ነፃ ትኬት
-
+def get_main_keyboard(user_id):
     keyboard = [
         [InlineKeyboardButton("🎰 ዕድልህን ሞክር (Spin)", callback_data="spin")],
         [InlineKeyboardButton("🎟️ የእኔ ትኬቶች", callback_data="my_tickets"), InlineKeyboardButton("👥 ጓደኛ ጋብዝ", callback_data="invite")],
     ]
     
-    # የቻናል ሊንክ ካለ መጨመር
     clean_channel = CHANNEL_ID.replace('@', '')
-    if not clean_channel.startswith("-100") and clean_channel:
+    if clean_channel and not clean_channel.startswith("-100"):
         keyboard.append([InlineKeyboardButton("📢 ቻናላችንን ይቀላቀሉ", url=f"https://t.me/{clean_channel}")])
         
     if user_id == ADMIN_ID:
         keyboard.append([InlineKeyboardButton("⚙️ Admin Panel", callback_data="admin_panel")])
+        
+    return InlineKeyboardMarkup(keyboard)
 
-    reply_markup = InlineKeyboardMarkup(keyboard)
+# --- COMMAND HANDLERS ---
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    registered_users.add(user_id)
+    
+    if user_id not in user_tickets:
+        user_tickets[user_id] = 3
+
+    reply_markup = get_main_keyboard(user_id)
     await update.message.reply_text(
         f"ሰላም {update.effective_user.first_name}! እንኳን ወደ እድል ማውጫ ቦት በደህና መጡ።\n\nያሉዎት ትኬቶች፦ {user_tickets[user_id]}",
         reply_markup=reply_markup
@@ -77,7 +79,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         user_tickets[user_id] -= 1
         
-        # 1. አኒሜሽን GIF መላክ
         anim_msg = None
         try:
             anim_msg = await query.message.reply_animation(
@@ -88,7 +89,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logger.error(f"Animation error: {e}")
 
-        # 2. እድል ማውጣት
         win_amount = spin_wheel()
         
         if win_amount > 0:
@@ -112,6 +112,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ref_link = f"https://t.me/{bot_username}?start={user_id}"
         await query.message.reply_text(f"🔗 የእርስዎ የመጋበዣ ሊንክ፦\n\n{ref_link}\n\nበዚህ ሊንክ ሰዎችን ሲጋብዙ ተጨማሪ ትኬት ያገኛሉ!")
 
+    elif query.data == "main_menu":
+        reply_markup = get_main_keyboard(user_id)
+        await query.message.reply_text("🏠 ወደ ዋናው ሜኑ ተመልሰዋል፦", reply_markup=reply_markup)
+
     elif query.data == "admin_panel" and user_id == ADMIN_ID:
         admin_keyboard = [
             [InlineKeyboardButton("📢 አሁኑኑ ማስታወቂያ ወደ ቻናል ልክ", callback_data="post_channel")],
@@ -133,16 +137,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # --- BROADCAST FUNCTIONS ---
 async def send_channel_broadcast(context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """ወደ ቻናል ብቻ ማስታወቂያ መላኪያ"""
     if not CHANNEL_ID:
-        logger.error("CHANNEL_ID is empty!")
         return False
         
     try:
         bot_username = (await context.bot.get_me()).username
         keyboard = [[InlineKeyboardButton("🎰 አሁኑኑ ተጫወቱ", url=f"https://t.me/{bot_username}")]]
         
-        # የቻናል ID ከሆነ ወደ integer መቀየር
         target_chat = int(CHANNEL_ID) if CHANNEL_ID.startswith("-100") or CHANNEL_ID.lstrip('-').isdigit() else CHANNEL_ID
         
         await context.bot.send_photo(
@@ -158,7 +159,6 @@ async def send_channel_broadcast(context: ContextTypes.DEFAULT_TYPE) -> bool:
         return False
 
 async def send_users_broadcast(context: ContextTypes.DEFAULT_TYPE) -> int:
-    """ለቦቱ ተጠቃሚዎች (Direct Message) ማስታወቂያ መላኪያ"""
     count = 0
     bot_username = (await context.bot.get_me()).username
     keyboard = [[InlineKeyboardButton("🎰 አሁኑኑ ተጫወቱ", url=f"https://t.me/{bot_username}")]]
@@ -173,13 +173,12 @@ async def send_users_broadcast(context: ContextTypes.DEFAULT_TYPE) -> int:
                 reply_markup=InlineKeyboardMarkup(keyboard)
             )
             count += 1
-            await asyncio.sleep(0.05) # Rate limit ለመከላከል
+            await asyncio.sleep(0.05)
         except Exception as e:
             logger.error(f"Failed to send to user {uid}: {e}")
     return count
 
 async def auto_post_job(context: ContextTypes.DEFAULT_TYPE):
-    """በየ 1 ሰዓቱ አውቶማቲክ ወደ ቻናል የሚልክ"""
     await send_channel_broadcast(context)
 
 # --- MAIN FUNCTION ---
@@ -193,7 +192,6 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(button_handler))
 
-    # በየ 1 ሰዓቱ (3600 ሰከንድ) አውቶማቲክ ማስታወቂያ እንዲልክ ማድረግ
     job_queue = app.job_queue
     if job_queue:
         job_queue.run_repeating(auto_post_job, interval=3600, first=10)
@@ -203,7 +201,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-         
-    
-                
+            
