@@ -6,7 +6,7 @@ import time
 from pathlib import Path
 from threading import Thread
 from flask import Flask
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -68,12 +68,13 @@ logger = logging.getLogger(__name__)
 # =========================================================
 pending_deposits = {}
 pending_withdrawals = {}
-main_wallets = {}    # uid_str -> balance (int)
-winning_wallets = {} # uid_str -> balance (int)
+main_wallets = {}        # uid_str -> balance (int)
+winning_wallets = {}     # uid_str -> balance (int)
+used_tx_ids = set()      # Used transaction IDs to prevent duplicates
 users = set()
 settings = DEFAULT_SETTINGS.copy()
-user_scratch_cards = {} # uid_str -> card_info
-user_states = {}        # uid_str -> state_name
+user_scratch_cards = {}  # uid_str -> card_info
+user_states = {}         # uid_str -> state_name/data
 
 def save_data():
     data = {
@@ -81,6 +82,7 @@ def save_data():
         "pending_withdrawals": pending_withdrawals,
         "main_wallets": main_wallets,
         "winning_wallets": winning_wallets,
+        "used_tx_ids": list(used_tx_ids),
         "users": list(users),
         "settings": settings,
         "user_scratch_cards": user_scratch_cards,
@@ -92,7 +94,7 @@ def save_data():
         logger.error(f"Save error: {e}")
 
 def load_data():
-    global pending_deposits, pending_withdrawals, main_wallets, winning_wallets, users, settings, user_scratch_cards
+    global pending_deposits, pending_withdrawals, main_wallets, winning_wallets, used_tx_ids, users, settings, user_scratch_cards
     if not DATA_FILE.exists():
         return
     try:
@@ -102,6 +104,7 @@ def load_data():
             pending_withdrawals = data.get("pending_withdrawals", {})
             main_wallets = data.get("main_wallets", {})
             winning_wallets = data.get("winning_wallets", {})
+            used_tx_ids = set(data.get("used_tx_ids", []))
             users = set(data.get("users", []))
             settings = DEFAULT_SETTINGS.copy()
             settings.update(data.get("settings", {}))
@@ -113,9 +116,17 @@ def is_admin(user_id):
     return user_id == ADMIN_ID
 
 # =========================================================
-# 🎛️ MENUS
+# 🎛️ MENUS & KEYBOARDS
 # =========================================================
-def main_menu(user_id):
+def bottom_persistent_keyboard():
+    # Persistent Menu Button under text input field
+    return ReplyKeyboardMarkup(
+        [[KeyboardButton("📱 Main Menu")]],
+        resize_keyboard=True,
+        is_persistent=True
+    )
+
+def main_inline_menu(user_id):
     m_bal = main_wallets.get(str(user_id), 0)
     w_bal = winning_wallets.get(str(user_id), 0)
     
@@ -123,7 +134,7 @@ def main_menu(user_id):
         [InlineKeyboardButton(f"🎟️ ትኬት ግዛ ({settings['ticket_price']} ETB)", callback_data="buy_ticket")],
         [InlineKeyboardButton("💵 ዲፖዚት አድርግ (Deposit)", callback_data="deposit")],
         [InlineKeyboardButton(f"👛 Wallet (Main: {m_bal} | Win: {w_bal})", callback_data="my_wallet")],
-        [InlineKeyboardButton("🏆 ሽልማት ተቀበል", callback_data="withdraw")],
+        [InlineKeyboardButton("🏆 ሽልማት ተቀበል (Withdraw)", callback_data="withdraw")],
         [InlineKeyboardButton("💳 የክፍያ መረጃ", callback_data="payment_info")],
     ]
     if user_id == ADMIN_ID:
@@ -139,7 +150,7 @@ def admin_menu():
     return InlineKeyboardMarkup(keyboard)
 
 # =========================================================
-# 🎲 SCRATCH LOGIC (25% WIN RATE)
+# 🎲 SCRATCH LOGIC
 # =========================================================
 def generate_prize():
     rand = random.random()
@@ -172,44 +183,79 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"💵 Main Wallet: **{main_wallets[uid_str]} ETB**\n"
         f"🏆 Winning Wallet: **{winning_wallets[uid_str]} ETB**\n\n"
         "👇 ከታች ያለውን ሜኑ ይጠቀሙ፦",
-        reply_markup=main_menu(user.id),
+        reply_markup=bottom_persistent_keyboard(),
+    )
+    await update.message.reply_text(
+        "🏠 **ዋና ሜኑ፦**",
+        reply_markup=main_inline_menu(user.id),
         parse_mode="Markdown"
     )
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     uid_str = str(user.id)
-    state = user_states.get(uid_str)
+    text = update.message.text.strip() if update.message.text else ""
 
-    # Deposit Amount Input
-    if state == "WAITING_DEPOSIT_AMOUNT" and update.message.text:
+    # Bottom Persistent Menu Handler
+    if text == "📱 Main Menu":
+        user_states.pop(uid_str, None)
+        await update.message.reply_text("🏠 **MAIN MENU**", reply_markup=main_inline_menu(user.id), parse_mode="Markdown")
+        return
+
+    state = user_states.get(uid_str, "")
+
+    # 1. DEPOSIT: Step 1 - Amount Input
+    if state == "WAITING_DEPOSIT_AMOUNT" and text:
         try:
-            amount = int(update.message.text.strip())
+            amount = int(text)
             if amount < 10:
                 await update.message.reply_text("❌ አነስተኛው የዲፖዚት መጠን 10 ETB ነው። እባክዎን በድጋሚ ያስገቡ፦")
                 return
             
-            user_states[uid_str] = f"WAITING_DEPOSIT_RECEIPT:{amount}"
+            user_states[uid_str] = f"WAITING_DEPOSIT_TXID:{amount}"
             await update.message.reply_text(
                 f"💳 **የ {amount} ETB ዲፖዚት ጥያቄ**\n\n"
                 f"{settings['payment_info']}\n\n"
-                f"📸 እባክዎን የ **{amount} ETB** ክፍያ ፈፅመው የደረሰኙን Screenshot አሁን ይላኩ።",
+                f"🔢 እባክዎን የላኩበትን **Transaction ID (የትራንዛክሽን ቁጥር)** ያስገቡ፦\n"
+                f"*(ምሳሌ፦ 1000421183458 ወይም Telebirr TXN ID)*",
                 parse_mode="Markdown"
             )
         except ValueError:
             await update.message.reply_text("❌ እባክዎን ትክክለኛ ቁጥር ብቻ ያስገቡ (ለምሳሌ፦ 50 ወይም 100)፦")
         return
 
-    # Deposit Receipt Photo
-    if update.message.photo and state and state.startswith("WAITING_DEPOSIT_RECEIPT:"):
+    # 2. DEPOSIT: Step 2 - Transaction ID Input
+    if state.startswith("WAITING_DEPOSIT_TXID:") and text:
         amount = int(state.split(":")[1])
+        tx_id = text.strip()
+
+        # Check for Duplicate Transaction ID
+        if tx_id in used_tx_ids:
+            await update.message.reply_text(
+                "❌ **ይህ የትራንዛክሽን ቁጥር ከዚህ ቀደም ስራ ላይ ውሏል!**\n\nእባክዎን ትክክለኛ እና አዲስ የትራንዛክሽን ቁጥር ያስገቡ፦",
+                parse_mode="Markdown"
+            )
+            return
+
+        user_states[uid_str] = f"WAITING_DEPOSIT_RECEIPT:{amount}:{tx_id}"
+        await update.message.reply_text(
+            f"✅ የትራንዛክሽን ቁጥር: `{tx_id}` ተመዝግቧል።\n\n📸 አሁን ደግሞ የ **{amount} ETB** ክፍያ ፈፅመው የደረሰኙን Screenshot ይላኩ።",
+            parse_mode="Markdown"
+        )
+        return
+
+    # 3. DEPOSIT: Step 3 - Receipt Photo Upload
+    if update.message.photo and state.startswith("WAITING_DEPOSIT_RECEIPT:"):
+        _, amount_str, tx_id = state.split(":")
+        amount = int(amount_str)
         photo_id = update.message.photo[-1].file_id
-        
+
         pending_deposits[uid_str] = {
             "user_id": user.id,
             "name": user.first_name,
-            "username": user.username or "",
+            "username": user.username or "የለውም",
             "amount": amount,
+            "tx_id": tx_id,
             "photo_id": photo_id,
         }
         user_states.pop(uid_str, None)
@@ -225,7 +271,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "📥 **NEW WALLET DEPOSIT REQUEST**\n\n"
             f"👤 Name: {user.first_name}\n"
             f"🆔 User ID: `{user.id}`\n"
-            f"💰 Requested Amount: **{amount} ETB**"
+            f"💰 Amount: **{amount} ETB**\n"
+            f"🔢 TX ID: `{tx_id}`"
         )
         await context.bot.send_photo(
             chat_id=ADMIN_ID,
@@ -235,9 +282,60 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=InlineKeyboardMarkup(keyboard),
         )
         await update.message.reply_text(
-            f"✅ **የ {amount} ETB ዲፖዚት ደረሰኝዎ ደርሶናል!**\n\n⏳ Admin ክፍያውን እያረጋገጠው ነው። ሲጸድቅ ወደ Main Walletዎ ገቢ ይሆናል።",
+            f"✅ **የ {amount} ETB ዲፖዚት ጥያቄዎ ደርሶናል!**\n\n⏳ Admin ክፍያውን አረጋግጦ ሲያጸድቀው ወደ Main Walletዎ ገቢ ይሆናል።",
             parse_mode="Markdown",
-            reply_markup=main_menu(user.id)
+            reply_markup=main_inline_menu(user.id)
+        )
+        return
+
+    # 4. WITHDRAWAL: Step 1 - Amount Input
+    if state == "WAITING_WITHDRAW_AMOUNT" and text:
+        try:
+            req_amount = int(text)
+            w_bal = winning_wallets.get(uid_str, 0)
+            if req_amount <= 0 or req_amount > w_bal:
+                await update.message.reply_text(f"❌ አልተቻለም! ማውጣት የሚችሉት ከ **1 - {w_bal} ETB** ብቻ ነው። እባክዎን በድጋሚ ያስገቡ፦")
+                return
+
+            user_states[uid_str] = f"WAITING_WITHDRAW_PHONE:{req_amount}"
+            await update.message.reply_text(
+                f"📱 **የ {req_amount} ETB ሽልማት ማውጫ**\n\n"
+                f"እባክዎን ካርዱ/ጥቅሉ እንዲላክሎት የሚፈልጉበትን **የስልክ ቁጥር** ያስገቡ፦",
+                parse_mode="Markdown"
+            )
+        except ValueError:
+            await update.message.reply_text("❌ እባክዎን ትክክለኛ ቁጥር ብቻ ያስገቡ፦")
+        return
+
+    # 5. WITHDRAWAL: Step 2 - Phone Number Input & Admin Notification
+    if state.startswith("WAITING_WITHDRAW_PHONE:") and text:
+        req_amount = int(state.split(":")[1])
+        phone_no = text.strip()
+
+        # Deduct from Winning Wallet
+        winning_wallets[uid_str] -= req_amount
+        user_states.pop(uid_str, None)
+        save_data()
+
+        username = f"@{user.username}" if user.username else "የለውም"
+        admin_alert = (
+            "🏆 **NEW PRIZE CLAIM REQUEST**\n\n"
+            f"👤 ደንበኛ: {user.first_name}\n"
+            f"🔗 Telegram: {username}\n"
+            f"🆔 User ID: `{user.id}`\n"
+            f"💰 የሚወጣው መጠን: **{req_amount} ETB**\n"
+            f"📱 የተላከው ስልክ ቁጥር: `{phone_no}`\n\n"
+            "👉 *እባክዎን በዚህ ስልክ ቁጥር ካርዱን/ጥቅሉን ያስተናግዱ!*"
+        )
+        await context.bot.send_message(chat_id=ADMIN_ID, text=admin_alert, parse_mode="Markdown")
+
+        await update.message.reply_text(
+            f"✅ **የሽልማት ጥያቄዎ ለአድሚን ተልኳል!**\n\n"
+            f"💰 የወጣበት መጠን: **{req_amount} ETB**\n"
+            f"📱 የቀረበው ስልክ: **{phone_no}**\n\n"
+            "👨‍💻 Admin በቅርቡ በተላከው ስልክ ቁጥር ካርዱን/ጥቅሉን ይልክልዎታል።",
+            parse_mode="Markdown",
+            reply_markup=main_inline_menu(user.id)
         )
 
 # =========================================================
@@ -252,7 +350,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "menu":
         user_states.pop(uid_str, None)
-        await query.edit_message_text("🏠 **MAIN MENU**", parse_mode="Markdown", reply_markup=main_menu(user_id))
+        await query.edit_message_text("🏠 **MAIN MENU**", parse_mode="Markdown", reply_markup=main_inline_menu(user_id))
     
     elif data == "my_wallet":
         m_bal = main_wallets.get(uid_str, 0)
@@ -261,7 +359,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"👛 **የእኔ WALLET**\n\n"
             f"💵 **Main Wallet (የጥሬ ብር):** {m_bal} ETB\n"
             f"🏆 **Winning Wallet (የሽልማት):** {w_bal} ETB\n\n"
-            "💡 *ከMain Wallet ላይ ትኬት መግዛት ይችላሉ። ያሸነፉትን ሽልማት ደግሞ መቀበል ይችላሉ።*"
+            "💡 *ከMain Wallet ላይ ትኬት መግዛት ይችላሉ። ያሸነፉትን ሽልማት ደግሞ ማውጣት ይችላሉ።*"
         )
         keyboard = [
             [InlineKeyboardButton("💵 ዲፖዚት አድርግ", callback_data="deposit")],
@@ -300,7 +398,6 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        # Deduct 10 ETB from Main Wallet
         main_wallets[uid_str] = m_bal - price
         res_type, amt = generate_prize()
         user_scratch_cards[uid_str] = {"result_type": res_type, "amount": amt}
@@ -323,24 +420,12 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("❌ **Winning Wallet ላይ የተቀመጠ አሸናፊ ሂሳብ/ሽልማት የለዎትም።**", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Menu", callback_data="menu")]]))
             return
 
-        # Notify Admin Inbox
-        username = f"@{query.from_user.username}" if query.from_user.username else "የለውም"
-        admin_alert = (
-            "🏆 **NEW PRIZE CLAIM REQUEST**\n\n"
-            f"👤 ደንበኛ: {query.from_user.first_name}\n"
-            f"🔗 Telegram Username: {username}\n"
-            f"🆔 User ID: `{user_id}`\n"
-            f"🎁 ያሸነፈው ሽልማት/ካርድ: **{w_bal} ETB**\n\n"
-            "👉 *እባክዎን ደንበኛውን በግል አናግረው የስልክ ቁጥሩን በመቀበል አስተናግዱት!*"
-        )
-        await context.bot.send_message(chat_id=ADMIN_ID, text=admin_alert, parse_mode="Markdown")
-
+        user_states[uid_str] = "WAITING_WITHDRAW_AMOUNT"
         await query.edit_message_text(
-            f"✅ **የሽልማት ጥያቄዎ ለAdmin ተልኳል!**\n\n"
-            f"🏆 ያሸነፉት መጠን: **{w_bal} ETB**\n\n"
-            "👨‍💻 Admin በቅርቡ በግል የቴሌግራም መልእክት አናግሮዎት በስልክ ቁጥርዎ ያስተናግድዎታል።",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 ወደ ዋና ሜኑ", callback_data="menu")]])
+            f"🏆 **የሽልማት ማውጫ**\n\n"
+            f"💰 የሚገኝ አጠቃላይ ሽልማት: **{w_bal} ETB**\n\n"
+            f"እባክዎን ማውጣት የሚፈልጉትን የብር/የካርድ መጠን በቁጥር ያስገቡ፦",
+            parse_mode="Markdown"
         )
 
     elif data == "payment_info":
@@ -354,7 +439,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "scratch":
         card_info = user_scratch_cards.pop(uid_str, None)
         if not card_info:
-            await query.edit_message_text("⚠️ ለመፈቀቅ የተዘጋጀ ካርድ አልተገኘም ወይም አስቀድመው ፈቅደውታል።", reply_markup=main_menu(user_id))
+            await query.edit_message_text("⚠️ ለመፈቀቅ የተዘጋጀ ካርድ አልተገኘም ወይም አስቀድመው ፈቅደውታል።", reply_markup=main_inline_menu(user_id))
             return
 
         result_type, amount = card_info["result_type"], card_info["amount"]
@@ -366,7 +451,6 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "ለጥቂት ነው! በዚህ ጊዜ አልወጣም።\nመልካም እድል ለቀጣይ! 🍀"
             )
         else:
-            # Add to Winning Wallet
             cur_w = winning_wallets.get(uid_str, 0)
             winning_wallets[uid_str] = cur_w + amount
             text = (
@@ -393,7 +477,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not is_admin(user_id): return
         await query.edit_message_text(f"👥 አጠቃላይ ተጠቃሚዎች፦ **{len(users)}**", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Admin Panel", callback_data="admin_panel")]]))
 
-    # Approve Deposit
+    # Approve/Reject Deposit
     elif data.startswith("dep_approve:") or data.startswith("dep_reject:"):
         if not is_admin(user_id): return
         action, target_uid_str = data.split(":")
@@ -405,22 +489,26 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         target_uid = int(target_uid_str)
         if action == "dep_approve":
             amt = dep_data["amount"]
+            tx_id = dep_data["tx_id"]
+
             main_wallets[target_uid_str] = main_wallets.get(target_uid_str, 0) + amt
+            used_tx_ids.add(tx_id)  # Record TX ID as used
             save_data()
+
             await context.bot.send_message(
                 chat_id=target_uid,
                 text=f"✅ **የ {amt} ETB ዲፖዚትዎ ጸድቋል!**\n\n💵 Main Wallet: **{main_wallets[target_uid_str]} ETB**\n\nአሁን የፋቅ ፋቅ ትኬት መግዛት ይችላሉ!",
                 parse_mode="Markdown",
-                reply_markup=main_menu(target_uid)
+                reply_markup=main_inline_menu(target_uid)
             )
-            await query.edit_message_caption(f"✅ **DEPOSIT APPROVED ({amt} ETB)**\n👤 {dep_data['name']}")
+            await query.edit_message_caption(f"✅ **DEPOSIT APPROVED ({amt} ETB)**\n👤 {dep_data['name']}\n🔢 TX ID: `{tx_id}`")
         else:
             save_data()
-            await context.bot.send_message(chat_id=target_uid, text="❌ የዲፖዚት ደረሰኝዎ አልተቀበለም።", reply_markup=main_menu(target_uid))
+            await context.bot.send_message(chat_id=target_uid, text="❌ የዲፖዚት ደረሰኝዎ አልተቀበለም።", reply_markup=main_inline_menu(target_uid))
             await query.edit_message_caption(f"❌ **DEPOSIT REJECTED**\n👤 {dep_data['name']}")
 
 # =========================================================
-# 🎬 MAIN FUNCTION (WITH AUTO-RESTART LOOP)
+# 🎬 MAIN FUNCTION
 # =========================================================
 def main():
     load_data()
@@ -430,7 +518,7 @@ def main():
     app.add_handler(MessageHandler(filters.PHOTO | filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(CallbackQueryHandler(callback_router))
 
-    print("🚀 Dual-Wallet Scratch & Win Lottery Bot is running...")
+    print("🚀 Lottery Bot with Withdrawal & Menu Button is running...")
     app.run_polling()
 
 if __name__ == "__main__":
