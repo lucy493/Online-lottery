@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import random
+import time
 from pathlib import Path
 from threading import Thread
 from flask import Flask
@@ -22,7 +23,7 @@ app = Flask('')
 
 @app.route('/')
 def home():
-    return "Bot is alive and running!"
+    return "Bot is alive and running 24/7!"
 
 def run():
     app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 8080)))
@@ -419,7 +420,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_caption(f"❌ **DEPOSIT REJECTED**\n👤 {dep_data['name']}")
 
 # =========================================================
-# 🎬 MAIN FUNCTION
+# 🎬 MAIN FUNCTION (WITH AUTO-RESTART LOOP)
 # =========================================================
 def main():
     load_data()
@@ -433,9 +434,9 @@ def main():
     app.run_polling()
 
 if __name__ == "__main__":
-    main()
-
-    
-        
-        
-
+    while True:
+        try:
+            main()
+        except Exception as e:
+            logger.error(f"Bot disconnected: {e}. Restarting in 5 seconds...")
+            time.sleep(5)
