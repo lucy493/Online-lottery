@@ -1,4 +1,4 @@
- import os
+import os
 import asyncio
 import random
 import logging
@@ -36,7 +36,14 @@ WEIGHTS = [80, 10, 5, 4, 0.9, 0.1]
 def spin_wheel():
     return random.choices(PRIZES, weights=WEIGHTS, k=1)[0]
 
-def get_main_keyboard(user_id):
+# --- COMMAND HANDLERS ---
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    registered_users.add(user_id)
+    
+    if user_id not in user_tickets:
+        user_tickets[user_id] = 3
+
     keyboard = [
         [InlineKeyboardButton("🎰 ዕድልህን ሞክር (Spin)", callback_data="spin")],
         [InlineKeyboardButton("🎟️ የእኔ ትኬቶች", callback_data="my_tickets"), InlineKeyboardButton("👥 ጓደኛ ጋብዝ", callback_data="invite")],
@@ -48,18 +55,8 @@ def get_main_keyboard(user_id):
         
     if user_id == ADMIN_ID:
         keyboard.append([InlineKeyboardButton("⚙️ Admin Panel", callback_data="admin_panel")])
-        
-    return InlineKeyboardMarkup(keyboard)
 
-# --- COMMAND HANDLERS ---
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    registered_users.add(user_id)
-    
-    if user_id not in user_tickets:
-        user_tickets[user_id] = 3
-
-    reply_markup = get_main_keyboard(user_id)
+    reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text(
         f"ሰላም {update.effective_user.first_name}! እንኳን ወደ እድል ማውጫ ቦት በደህና መጡ።\n\nያሉዎት ትኬቶች፦ {user_tickets[user_id]}",
         reply_markup=reply_markup
@@ -111,10 +108,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         bot_username = (await context.bot.get_me()).username
         ref_link = f"https://t.me/{bot_username}?start={user_id}"
         await query.message.reply_text(f"🔗 የእርስዎ የመጋበዣ ሊንክ፦\n\n{ref_link}\n\nበዚህ ሊንክ ሰዎችን ሲጋብዙ ተጨማሪ ትኬት ያገኛሉ!")
-
-    elif query.data == "main_menu":
-        reply_markup = get_main_keyboard(user_id)
-        await query.message.reply_text("🏠 ወደ ዋናው ሜኑ ተመልሰዋል፦", reply_markup=reply_markup)
 
     elif query.data == "admin_panel" and user_id == ADMIN_ID:
         admin_keyboard = [
@@ -201,4 +194,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-            
+                
